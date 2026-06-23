@@ -1547,6 +1547,13 @@ bool EventHub::setKeyboardLayoutOverlay(int32_t deviceId, std::shared_ptr<KeyCha
     if (device == nullptr || device->keyMap.keyCharacterMap == nullptr) {
         return false;
     }
+
+    // Skip overlay for stmpe keyboard - it has complete custom mappings
+    if (device->identifier.name == "stmpe_keypad") {
+        ALOGW("EventHub: Skipping overlay for stmpe_keypad - using native kcm layout");
+        return false;
+    }
+     
     if (map == nullptr) {
         device->keyMap.keyCharacterMap->clearLayoutOverlay();
         return true;
