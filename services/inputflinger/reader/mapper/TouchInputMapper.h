@@ -228,6 +228,7 @@ protected:
     struct Parameters {
         enum class DeviceType {
             TOUCH_SCREEN,
+            TOUCH_PAD,
             TOUCH_NAVIGATION,
             POINTER,
 
