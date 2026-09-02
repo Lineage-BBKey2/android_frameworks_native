@@ -1691,8 +1691,63 @@ EGLImageKHR eglCreateImageTmpl(EGLDisplay dpy, EGLContext ctx, EGLenum target,
     EGLImageKHR result = EGL_NO_IMAGE_KHR;
     egl_connection_t* const cnx = &gEGLImpl;
     if (cnx->dso && eglCreateImageFunc) {
-        result = eglCreateImageFunc(dp->disp.dpy, c ? c->context : EGL_NO_CONTEXT, target, buffer,
-                                    attrib_list);
+        const EGLContext driverContext = c ? c->context : EGL_NO_CONTEXT;
+        const AttrType* driverAttribs = attrib_list;
+
+        result = eglCreateImageFunc(dp->disp.dpy, driverContext, target, buffer, driverAttribs);
+
+        if (result == EGL_NO_IMAGE_KHR && target == EGL_GL_TEXTURE_2D_KHR &&
+            driverAttribs) {
+            bool imagePreserved = false;
+            for (const AttrType* attr = driverAttribs; attr[0] != EGL_NONE; attr += 2) {
+                if (attr[0] == EGL_IMAGE_PRESERVED_KHR && attr[1] == EGL_TRUE) {
+                    imagePreserved = true;
+                    break;
+                }
+            }
+
+            if (imagePreserved) {
+                const EGLint firstError = cnx->egl.eglGetError();
+
+                EGLImageKHR sameRetry =
+                        eglCreateImageFunc(dp->disp.dpy, driverContext, target, buffer,
+                                           driverAttribs);
+
+                if (sameRetry != EGL_NO_IMAGE_KHR) {
+                    ALOGE("BBRY_EGL_IMAGE_RETRY target=0x%x buffer=%p "
+                          "firstError=0x%x sameRetry=1 preserveFalseRetry=-1",
+                          target, buffer, firstError);
+                    result = sameRetry;
+                } else {
+                    const EGLint sameRetryError = cnx->egl.eglGetError();
+
+                    std::vector<AttrType> retryAttribs;
+                    for (const AttrType* attr = driverAttribs; attr[0] != EGL_NONE;
+                         attr += 2) {
+                        retryAttribs.push_back(attr[0]);
+                        retryAttribs.push_back(
+                                attr[0] == EGL_IMAGE_PRESERVED_KHR
+                                        ? static_cast<AttrType>(EGL_FALSE)
+                                        : attr[1]);
+                    }
+                    retryAttribs.push_back(static_cast<AttrType>(EGL_NONE));
+
+                    EGLImageKHR preserveFalseRetry =
+                            eglCreateImageFunc(dp->disp.dpy, driverContext, target, buffer,
+                                               retryAttribs.data());
+
+                    ALOGE("BBRY_EGL_IMAGE_RETRY target=0x%x buffer=%p "
+                          "firstError=0x%x sameError=0x%x sameRetry=0 "
+                          "preserveFalseRetry=%d",
+                          target, buffer, firstError, sameRetryError,
+                          preserveFalseRetry != EGL_NO_IMAGE_KHR ? 1 : 0);
+
+                    if (preserveFalseRetry != EGL_NO_IMAGE_KHR) {
+                        result = preserveFalseRetry;
+                    }
+                }
+            }
+        }
     }
     return result;
 }
