@@ -16,6 +16,7 @@
 
 #include <inttypes.h>
 #include <log/log.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <time.h>
@@ -33,6 +34,7 @@ namespace {
 
 constexpr size_t kMaxTextureRecords = 4096;
 constexpr size_t kMaxImageRecords = 4096;
+constexpr size_t kMaxRawContextAttributePairs = 8;
 
 using PFN_glGenTextures = void(GL_APIENTRYP)(GLsizei, GLuint*);
 using PFN_glDeleteTextures = void(GL_APIENTRYP)(GLsizei, const GLuint*);
@@ -105,7 +107,12 @@ struct ContextRecord {
     EGLint noError = 0;
     EGLint resetStrategy = 0;
     EGLint priority = 0;
+    EGLint robustAccess = 0;
+    EGLint profileMask = 0;
     uint32_t attributeCount = 0;
+    uint32_t rawAttributeCount = 0;
+    EGLint rawAttributeKeys[kMaxRawContextAttributePairs] = {};
+    EGLint rawAttributeValues[kMaxRawContextAttributePairs] = {};
     uint64_t attributeHash = 14695981039346656037ULL;
     bool createObserved = false;
     bool destroyRequested = false;
@@ -179,6 +186,7 @@ uint64_t gImageFailureTotal = 0;
 uint64_t gImageDestroyTotal = 0;
 uint64_t gLiveImageTotal = 0;
 uint64_t gPeakLiveImageTotal = 0;
+uint64_t gMakeCurrentSequence = 0;
 
 thread_local EGLContext gCurrentContext = EGL_NO_CONTEXT;
 thread_local uint64_t gCurrentGroup = 0;
@@ -204,6 +212,11 @@ void parseContextAttributes(const EGLint* attributes, ContextRecord* record) {
         record->attributeHash *= 1099511628211ULL;
         record->attributeHash ^= static_cast<uint32_t>(attributes[1]);
         record->attributeHash *= 1099511628211ULL;
+        if (record->rawAttributeCount < kMaxRawContextAttributePairs) {
+            const uint32_t index = record->rawAttributeCount++;
+            record->rawAttributeKeys[index] = attributes[0];
+            record->rawAttributeValues[index] = attributes[1];
+        }
         switch (attributes[0]) {
             case 0x3098: // EGL_CONTEXT_CLIENT_VERSION / EGL_CONTEXT_MAJOR_VERSION_KHR
                 record->clientVersion = attributes[1];
@@ -220,12 +233,46 @@ void parseContextAttributes(const EGLint* attributes, ContextRecord* record) {
             case 0x31BD: // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_KHR
                 record->resetStrategy = attributes[1];
                 break;
+            case 0x3138: // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT
+                record->resetStrategy = attributes[1];
+                break;
+            case 0x30BF: // EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT
+                record->robustAccess = attributes[1];
+                break;
+            case 0x30FD: // EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR
+                record->profileMask = attributes[1];
+                break;
             case 0x3100: // EGL_CONTEXT_PRIORITY_LEVEL_IMG
                 record->priority = attributes[1];
                 break;
             default:
                 break;
         }
+    }
+}
+
+void formatContextAttributes(const ContextRecord& record, char* output, size_t outputSize) {
+    if (!output || outputSize == 0) return;
+    output[0] = '\0';
+    if (record.rawAttributeCount == 0) {
+        snprintf(output, outputSize, "none");
+        return;
+    }
+
+    size_t used = 0;
+    for (uint32_t i = 0; i < record.rawAttributeCount && used < outputSize; i++) {
+        const int written = snprintf(output + used, outputSize - used, "%s0x%x:0x%x",
+                                     i ? "," : "", record.rawAttributeKeys[i],
+                                     record.rawAttributeValues[i]);
+        if (written < 0) return;
+        if (static_cast<size_t>(written) >= outputSize - used) {
+            output[outputSize - 1] = '\0';
+            return;
+        }
+        used += static_cast<size_t>(written);
+    }
+    if (record.attributeCount > record.rawAttributeCount && used < outputSize) {
+        snprintf(output + used, outputSize - used, ",...");
     }
 }
 
@@ -536,13 +583,17 @@ EGLContext EGLAPIENTRY layerEglCreateContext(EGLDisplay display, EGLConfig confi
         gContexts[reinterpret_cast<uintptr_t>(result)] = record;
     }
     char threadName[16];
+    char rawAttributes[256];
     getThreadName(threadName);
+    formatContextAttributes(record, rawAttributes, sizeof(rawAttributes));
     ALOGI("BBRY_GL_CONTEXT_CREATE ctx=%p share=%p group=%" PRIu64
           " display=%p config=%p tid=%d thread=%s clientVersion=%d minorVersion=%d "
-          "flags=0x%x noError=%d reset=0x%x priority=0x%x attrCount=%u attrHash=0x%" PRIx64,
+          "flags=0x%x noError=%d reset=0x%x priority=0x%x robust=%d profile=0x%x "
+          "attrCount=%u attrHash=0x%" PRIx64 " attrs=%s",
           result, shareContext, group, display, config, gettid(), threadName,
           record.clientVersion, record.minorVersion, record.flags, record.noError,
-          record.resetStrategy, record.priority, record.attributeCount, record.attributeHash);
+          record.resetStrategy, record.priority, record.robustAccess, record.profileMask,
+          record.attributeCount, record.attributeHash, rawAttributes);
     return result;
 }
 
@@ -559,46 +610,94 @@ EGLBoolean EGLAPIENTRY layerEglDestroyContext(EGLDisplay display, EGLContext con
 EGLBoolean EGLAPIENTRY layerEglMakeCurrent(EGLDisplay display, EGLSurface draw, EGLSurface read,
                                            EGLContext context) {
     const EGLContext previousContext = gCurrentContext;
+    const uint64_t previousGroup = gCurrentGroup;
+    const EGLSurface previousDraw = gCurrentDraw;
+    const EGLSurface previousRead = gCurrentRead;
     EGLBoolean result = gNextEglMakeCurrent(display, draw, read, context);
     if (result == EGL_TRUE) {
         const uint64_t timestamp = nowNs();
         const pid_t tid = gettid();
+        uint64_t switchSequence = 0;
+        uint64_t newGroup = 0;
+        uint64_t previousUnbindCount = 0;
+        ContextRecord contextSnapshot;
+        {
+            std::lock_guard<std::mutex> guard(gLock);
+            if (previousContext != EGL_NO_CONTEXT && previousContext != context) {
+                auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
+                if (previous != gContexts.end()) {
+                    previous->second.unbindCount++;
+                    previousUnbindCount = previous->second.unbindCount;
+                }
+            }
+            newGroup = groupForContextLocked(context);
+            if (context != EGL_NO_CONTEXT) {
+                ContextRecord& record = gContexts[reinterpret_cast<uintptr_t>(context)];
+                record.makeCurrentCount++;
+                if (!record.firstCurrentTid) record.firstCurrentTid = tid;
+                if (record.lastCurrentTid && record.lastCurrentTid != tid) {
+                    record.migrationCount++;
+                }
+                record.lastCurrentTid = tid;
+                record.lastCurrentNs = timestamp;
+                record.lastDraw = draw;
+                record.lastRead = read;
+                contextSnapshot = record;
+            }
+            switchSequence = ++gMakeCurrentSequence;
+        }
         gCurrentContext = context;
+        gCurrentGroup = newGroup;
         gCurrentDraw = draw;
         gCurrentRead = read;
-        std::lock_guard<std::mutex> guard(gLock);
-        if (previousContext != EGL_NO_CONTEXT && previousContext != context) {
-            auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
-            if (previous != gContexts.end()) previous->second.unbindCount++;
-        }
-        gCurrentGroup = groupForContextLocked(context);
-        if (context != EGL_NO_CONTEXT) {
-            ContextRecord& record = gContexts[reinterpret_cast<uintptr_t>(context)];
-            record.makeCurrentCount++;
-            if (!record.firstCurrentTid) record.firstCurrentTid = tid;
-            if (record.lastCurrentTid && record.lastCurrentTid != tid) record.migrationCount++;
-            record.lastCurrentTid = tid;
-            record.lastCurrentNs = timestamp;
-            record.lastDraw = draw;
-            record.lastRead = read;
-        }
+
+        char threadName[16];
+        getThreadName(threadName);
+        ALOGI("BBRY_GL_CONTEXT_SWITCH seq=%" PRIu64 " display=%p tid=%d thread=%s "
+              "oldCtx=%p oldGroup=%" PRIu64 " oldDraw=%p oldRead=%p "
+              "newCtx=%p newGroup=%" PRIu64 " newDraw=%p newRead=%p sameCtx=%d "
+              "oldUnbind=%" PRIu64 " newMakeCurrent=%" PRIu64
+              " newUnbind=%" PRIu64 " newMigrations=%" PRIu64,
+              switchSequence, display, tid, threadName, previousContext, previousGroup,
+              previousDraw, previousRead, context, newGroup, draw, read,
+              previousContext == context ? 1 : 0, previousUnbindCount,
+              contextSnapshot.makeCurrentCount, contextSnapshot.unbindCount,
+              contextSnapshot.migrationCount);
     }
     return result;
 }
 
 EGLBoolean EGLAPIENTRY layerEglReleaseThread() {
     const EGLContext previousContext = gCurrentContext;
+    const uint64_t previousGroup = gCurrentGroup;
+    const EGLSurface previousDraw = gCurrentDraw;
+    const EGLSurface previousRead = gCurrentRead;
     EGLBoolean result = gNextEglReleaseThread();
     if (result == EGL_TRUE) {
-        if (previousContext != EGL_NO_CONTEXT) {
+        uint64_t releaseSequence = 0;
+        uint64_t previousUnbindCount = 0;
+        {
             std::lock_guard<std::mutex> guard(gLock);
-            auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
-            if (previous != gContexts.end()) previous->second.unbindCount++;
+            if (previousContext != EGL_NO_CONTEXT) {
+                auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
+                if (previous != gContexts.end()) {
+                    previous->second.unbindCount++;
+                    previousUnbindCount = previous->second.unbindCount;
+                }
+            }
+            releaseSequence = ++gMakeCurrentSequence;
         }
         gCurrentContext = EGL_NO_CONTEXT;
         gCurrentGroup = 0;
         gCurrentDraw = EGL_NO_SURFACE;
         gCurrentRead = EGL_NO_SURFACE;
+
+        char threadName[16];
+        getThreadName(threadName);
+        ALOGI("BBRY_GL_RELEASE_THREAD seq=%" PRIu64 " tid=%d thread=%s oldCtx=%p "
+              "oldGroup=%" PRIu64 " oldDraw=%p oldRead=%p oldUnbind=%" PRIu64,
+              releaseSequence, gettid(), threadName, previousContext, previousGroup,
+              previousDraw, previousRead, previousUnbindCount);
     }
     return result;
 }
