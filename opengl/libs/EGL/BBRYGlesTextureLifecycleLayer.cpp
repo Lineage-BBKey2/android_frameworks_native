@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <log/log.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -86,6 +87,27 @@ PFN_glEGLImageTargetTextureStorageEXT gNextGlEGLImageTargetTextureStorageEXT = n
 struct ContextRecord {
     uint64_t group = 0;
     EGLContext shareContext = EGL_NO_CONTEXT;
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLConfig config = nullptr;
+    uint64_t createNs = 0;
+    uint64_t lastCurrentNs = 0;
+    uint64_t makeCurrentCount = 0;
+    uint64_t unbindCount = 0;
+    uint64_t migrationCount = 0;
+    pid_t createTid = 0;
+    pid_t firstCurrentTid = 0;
+    pid_t lastCurrentTid = 0;
+    EGLSurface lastDraw = EGL_NO_SURFACE;
+    EGLSurface lastRead = EGL_NO_SURFACE;
+    EGLint clientVersion = 1;
+    EGLint minorVersion = 0;
+    EGLint flags = 0;
+    EGLint noError = 0;
+    EGLint resetStrategy = 0;
+    EGLint priority = 0;
+    uint32_t attributeCount = 0;
+    uint64_t attributeHash = 14695981039346656037ULL;
+    bool createObserved = false;
     bool destroyRequested = false;
 };
 
@@ -160,6 +182,52 @@ uint64_t gPeakLiveImageTotal = 0;
 
 thread_local EGLContext gCurrentContext = EGL_NO_CONTEXT;
 thread_local uint64_t gCurrentGroup = 0;
+thread_local EGLSurface gCurrentDraw = EGL_NO_SURFACE;
+thread_local EGLSurface gCurrentRead = EGL_NO_SURFACE;
+
+void getThreadName(char (&name)[16]) {
+    memset(name, 0, sizeof(name));
+    if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0 || !name[0]) {
+        memcpy(name, "unknown", sizeof("unknown"));
+    }
+}
+
+void parseContextAttributes(const EGLint* attributes, ContextRecord* record) {
+    if (!record) return;
+
+    // Bound the diagnostic parser even though EGL attribute lists are required
+    // to be EGL_NONE-terminated.
+    for (size_t pair = 0; attributes && pair < 32 && attributes[0] != EGL_NONE;
+         pair++, attributes += 2) {
+        record->attributeCount++;
+        record->attributeHash ^= static_cast<uint32_t>(attributes[0]);
+        record->attributeHash *= 1099511628211ULL;
+        record->attributeHash ^= static_cast<uint32_t>(attributes[1]);
+        record->attributeHash *= 1099511628211ULL;
+        switch (attributes[0]) {
+            case 0x3098: // EGL_CONTEXT_CLIENT_VERSION / EGL_CONTEXT_MAJOR_VERSION_KHR
+                record->clientVersion = attributes[1];
+                break;
+            case 0x30FB: // EGL_CONTEXT_MINOR_VERSION_KHR
+                record->minorVersion = attributes[1];
+                break;
+            case 0x30FC: // EGL_CONTEXT_FLAGS_KHR
+                record->flags = attributes[1];
+                break;
+            case 0x31B3: // EGL_CONTEXT_OPENGL_NO_ERROR_KHR
+                record->noError = attributes[1];
+                break;
+            case 0x31BD: // EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_KHR
+                record->resetStrategy = attributes[1];
+                break;
+            case 0x3100: // EGL_CONTEXT_PRIORITY_LEVEL_IMG
+                record->priority = attributes[1];
+                break;
+            default:
+                break;
+        }
+    }
+}
 
 uint64_t nowNs() {
     timespec ts{};
@@ -180,7 +248,9 @@ uint64_t groupForContextLocked(EGLContext context) {
     if (found != gContexts.end()) return found->second.group;
 
     const uint64_t group = gNextGroup++;
-    gContexts.emplace(key, ContextRecord{group, EGL_NO_CONTEXT, false});
+    ContextRecord record;
+    record.group = group;
+    gContexts.emplace(key, record);
     return group;
 }
 
@@ -311,10 +381,15 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
     uint64_t liveTotal = 0;
     uint64_t peakLiveTotal = 0;
     size_t trackedImages = 0;
+    ContextRecord contextSnapshot;
 
     {
         std::lock_guard<std::mutex> guard(gLock);
         group = groupForContextLocked(context);
+        auto contextIt = gContexts.find(reinterpret_cast<uintptr_t>(context));
+        if (contextIt != gContexts.end()) {
+            contextSnapshot = contextIt->second;
+        }
         const TextureKey key{group, texture};
         auto found = gTextures.find(key);
         foundRecord = found != gTextures.end();
@@ -342,6 +417,9 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
         trackedImages = gImages.size();
     }
 
+    char threadName[16];
+    getThreadName(threadName);
+
     if (image != EGL_NO_IMAGE_KHR) {
         ALOGI("BBRY_GL_TEX_IMAGE_OK api=%s ctx=%p currentCtx=%p ctxGroup=%" PRIu64
               " currentGroup=%" PRIu64 " texture=0x%x found=%d generation=%u reuse=%u "
@@ -349,7 +427,13 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
               "internal=0x%x size=%dx%d format=0x%x type=0x%x pixels=%d storageCalls=%u "
               "uploads=%u imageSuccess=%u liveImages=%u requestLevel=%d preserved=%d "
               "globalSuccess=%" PRIu64 " globalFail=%" PRIu64 " globalDestroy=%" PRIu64
-              " globalLive=%" PRIu64 " globalPeak=%" PRIu64 " trackedImages=%zu",
+              " globalLive=%" PRIu64 " globalPeak=%" PRIu64 " trackedImages=%zu "
+              "tid=%d thread=%s ctxCreated=%d ctxAgeUs=%" PRIu64 " config=%p "
+              "clientVersion=%d minorVersion=%d flags=0x%x noError=%d reset=0x%x "
+              "priority=0x%x attrCount=%u attrHash=0x%" PRIx64
+              " makeCurrent=%" PRIu64 " unbind=%" PRIu64
+              " migrations=%" PRIu64 " firstCurrentTid=%d lastCurrentTid=%d "
+              "currentAgeUs=%" PRIu64 " draw=%p read=%p currentDraw=%p currentRead=%p",
               api, context, gCurrentContext, group, gCurrentGroup, texture,
               foundRecord ? 1 : 0, snapshot.generation, snapshot.reuseCount, snapshot.lastOp,
               ageUs(snapshot.lastMutationNs, timestamp), snapshot.target, snapshot.level,
@@ -357,7 +441,18 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
               snapshot.format, snapshot.type, snapshot.pixelsPresent ? 1 : 0,
               snapshot.storageCalls, snapshot.uploadCalls, snapshot.imageSuccesses,
               snapshot.liveImages, level, preserved, successTotal, failureTotal, destroyTotal,
-              liveTotal, peakLiveTotal, trackedImages);
+              liveTotal, peakLiveTotal, trackedImages, gettid(), threadName,
+              contextSnapshot.createObserved ? 1 : 0,
+              ageUs(contextSnapshot.createNs, timestamp),
+              contextSnapshot.config, contextSnapshot.clientVersion,
+              contextSnapshot.minorVersion, contextSnapshot.flags, contextSnapshot.noError,
+              contextSnapshot.resetStrategy, contextSnapshot.priority,
+              contextSnapshot.attributeCount, contextSnapshot.attributeHash,
+              contextSnapshot.makeCurrentCount, contextSnapshot.unbindCount,
+              contextSnapshot.migrationCount, contextSnapshot.firstCurrentTid,
+              contextSnapshot.lastCurrentTid,
+              ageUs(contextSnapshot.lastCurrentNs, timestamp), contextSnapshot.lastDraw,
+              contextSnapshot.lastRead, gCurrentDraw, gCurrentRead);
         return;
     }
 
@@ -369,7 +464,13 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
           "imageSuccess=%u imageFail=%u liveImages=%u imageDestroy=%u retiredLiveImages=%u "
           "lastSuccessAgeUs=%" PRIu64 " requestLevel=%d preserved=%d globalSuccess=%" PRIu64
           " globalFail=%" PRIu64 " globalDestroy=%" PRIu64 " globalLive=%" PRIu64
-          " globalPeak=%" PRIu64 " trackedImages=%zu",
+          " globalPeak=%" PRIu64 " trackedImages=%zu tid=%d thread=%s ctxCreated=%d "
+          "ctxAgeUs=%" PRIu64 " config=%p clientVersion=%d minorVersion=%d flags=0x%x "
+          "noError=%d reset=0x%x priority=0x%x attrCount=%u attrHash=0x%" PRIx64
+          " makeCurrent=%" PRIu64
+          " unbind=%" PRIu64 " migrations=%" PRIu64 " firstCurrentTid=%d "
+          "lastCurrentTid=%d currentAgeUs=%" PRIu64 " draw=%p read=%p currentDraw=%p "
+          "currentRead=%p",
           api, context, gCurrentContext, group, gCurrentGroup, texture, foundRecord ? 1 : 0,
           snapshot.generation, snapshot.reuseCount, snapshot.live ? 1 : 0,
           snapshot.generated ? 1 : 0, snapshot.deleteRequested ? 1 : 0, snapshot.lastOp,
@@ -381,7 +482,15 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
           snapshot.imageFailures, snapshot.liveImages, snapshot.imageDestroys,
           snapshot.retiredLiveImages, ageUs(snapshot.lastImageSuccessNs, timestamp), level,
           preserved, successTotal, failureTotal, destroyTotal, liveTotal, peakLiveTotal,
-          trackedImages);
+          trackedImages, gettid(), threadName, contextSnapshot.createObserved ? 1 : 0,
+          ageUs(contextSnapshot.createNs, timestamp), contextSnapshot.config,
+          contextSnapshot.clientVersion, contextSnapshot.minorVersion, contextSnapshot.flags,
+          contextSnapshot.noError, contextSnapshot.resetStrategy, contextSnapshot.priority,
+          contextSnapshot.attributeCount, contextSnapshot.attributeHash,
+          contextSnapshot.makeCurrentCount, contextSnapshot.unbindCount,
+          contextSnapshot.migrationCount, contextSnapshot.firstCurrentTid,
+          contextSnapshot.lastCurrentTid, ageUs(contextSnapshot.lastCurrentNs, timestamp),
+          contextSnapshot.lastDraw, contextSnapshot.lastRead, gCurrentDraw, gCurrentRead);
 }
 
 void recordImageDestroy(EGLImageKHR image, EGLBoolean result) {
@@ -409,14 +518,31 @@ EGLContext EGLAPIENTRY layerEglCreateContext(EGLDisplay display, EGLConfig confi
     EGLContext result = gNextEglCreateContext(display, config, shareContext, attributes);
     if (result == EGL_NO_CONTEXT) return result;
 
+    const uint64_t timestamp = nowNs();
+    ContextRecord record;
+    record.shareContext = shareContext;
+    record.display = display;
+    record.config = config;
+    record.createNs = timestamp;
+    record.createTid = gettid();
+    record.createObserved = true;
+    parseContextAttributes(attributes, &record);
+
     uint64_t group;
     {
         std::lock_guard<std::mutex> guard(gLock);
         group = shareContext == EGL_NO_CONTEXT ? gNextGroup++ : groupForContextLocked(shareContext);
-        gContexts[reinterpret_cast<uintptr_t>(result)] =
-                ContextRecord{group, shareContext, false};
+        record.group = group;
+        gContexts[reinterpret_cast<uintptr_t>(result)] = record;
     }
-    ALOGI("BBRY_GL_CONTEXT_CREATE ctx=%p share=%p group=%" PRIu64, result, shareContext, group);
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_CONTEXT_CREATE ctx=%p share=%p group=%" PRIu64
+          " display=%p config=%p tid=%d thread=%s clientVersion=%d minorVersion=%d "
+          "flags=0x%x noError=%d reset=0x%x priority=0x%x attrCount=%u attrHash=0x%" PRIx64,
+          result, shareContext, group, display, config, gettid(), threadName,
+          record.clientVersion, record.minorVersion, record.flags, record.noError,
+          record.resetStrategy, record.priority, record.attributeCount, record.attributeHash);
     return result;
 }
 
@@ -432,20 +558,47 @@ EGLBoolean EGLAPIENTRY layerEglDestroyContext(EGLDisplay display, EGLContext con
 
 EGLBoolean EGLAPIENTRY layerEglMakeCurrent(EGLDisplay display, EGLSurface draw, EGLSurface read,
                                            EGLContext context) {
+    const EGLContext previousContext = gCurrentContext;
     EGLBoolean result = gNextEglMakeCurrent(display, draw, read, context);
     if (result == EGL_TRUE) {
+        const uint64_t timestamp = nowNs();
+        const pid_t tid = gettid();
         gCurrentContext = context;
+        gCurrentDraw = draw;
+        gCurrentRead = read;
         std::lock_guard<std::mutex> guard(gLock);
+        if (previousContext != EGL_NO_CONTEXT && previousContext != context) {
+            auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
+            if (previous != gContexts.end()) previous->second.unbindCount++;
+        }
         gCurrentGroup = groupForContextLocked(context);
+        if (context != EGL_NO_CONTEXT) {
+            ContextRecord& record = gContexts[reinterpret_cast<uintptr_t>(context)];
+            record.makeCurrentCount++;
+            if (!record.firstCurrentTid) record.firstCurrentTid = tid;
+            if (record.lastCurrentTid && record.lastCurrentTid != tid) record.migrationCount++;
+            record.lastCurrentTid = tid;
+            record.lastCurrentNs = timestamp;
+            record.lastDraw = draw;
+            record.lastRead = read;
+        }
     }
     return result;
 }
 
 EGLBoolean EGLAPIENTRY layerEglReleaseThread() {
+    const EGLContext previousContext = gCurrentContext;
     EGLBoolean result = gNextEglReleaseThread();
     if (result == EGL_TRUE) {
+        if (previousContext != EGL_NO_CONTEXT) {
+            std::lock_guard<std::mutex> guard(gLock);
+            auto previous = gContexts.find(reinterpret_cast<uintptr_t>(previousContext));
+            if (previous != gContexts.end()) previous->second.unbindCount++;
+        }
         gCurrentContext = EGL_NO_CONTEXT;
         gCurrentGroup = 0;
+        gCurrentDraw = EGL_NO_SURFACE;
+        gCurrentRead = EGL_NO_SURFACE;
     }
     return result;
 }
