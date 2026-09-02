@@ -2,8 +2,9 @@
  * Temporary GLES layer for the BlackBerry SDM660 EGLImage investigation.
  *
  * This records texture-name reuse, storage mutations, context share groups,
- * and live EGLImages. It logs a single snapshot when creation of an
- * EGL_GL_TEXTURE_2D_KHR image ultimately fails.
+ * and live EGLImages. It logs snapshots for successful and failed
+ * EGL_GL_TEXTURE_2D_KHR image creation so otherwise-identical allocations
+ * can be compared around the first failure.
  */
 
 #define LOG_TAG "BBRYGlesLifecycle"
@@ -151,6 +152,11 @@ std::unordered_map<TextureKey, TextureRecord, TextureKeyHash> gTextures;
 std::unordered_map<uintptr_t, ImageRecord> gImages;
 uint64_t gNextGroup = 1;
 uint64_t gSequence = 0;
+uint64_t gImageSuccessTotal = 0;
+uint64_t gImageFailureTotal = 0;
+uint64_t gImageDestroyTotal = 0;
+uint64_t gLiveImageTotal = 0;
+uint64_t gPeakLiveImageTotal = 0;
 
 thread_local EGLContext gCurrentContext = EGL_NO_CONTEXT;
 thread_local uint64_t gCurrentGroup = 0;
@@ -299,6 +305,12 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
     TextureRecord snapshot;
     bool foundRecord = false;
     uint64_t group = 0;
+    uint64_t successTotal = 0;
+    uint64_t failureTotal = 0;
+    uint64_t destroyTotal = 0;
+    uint64_t liveTotal = 0;
+    uint64_t peakLiveTotal = 0;
+    size_t trackedImages = 0;
 
     {
         std::lock_guard<std::mutex> guard(gLock);
@@ -314,13 +326,40 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
             record.lastImageSuccessNs = timestamp;
             if (gImages.size() >= kMaxImageRecords) gImages.erase(gImages.begin());
             gImages[reinterpret_cast<uintptr_t>(image)] = ImageRecord{key, record.generation};
+            gImageSuccessTotal++;
+            gLiveImageTotal++;
+            gPeakLiveImageTotal = std::max(gPeakLiveImageTotal, gLiveImageTotal);
         } else {
             record.imageFailures++;
+            gImageFailureTotal++;
         }
         snapshot = record;
+        successTotal = gImageSuccessTotal;
+        failureTotal = gImageFailureTotal;
+        destroyTotal = gImageDestroyTotal;
+        liveTotal = gLiveImageTotal;
+        peakLiveTotal = gPeakLiveImageTotal;
+        trackedImages = gImages.size();
     }
 
-    if (image != EGL_NO_IMAGE_KHR) return;
+    if (image != EGL_NO_IMAGE_KHR) {
+        ALOGI("BBRY_GL_TEX_IMAGE_OK api=%s ctx=%p currentCtx=%p ctxGroup=%" PRIu64
+              " currentGroup=%" PRIu64 " texture=0x%x found=%d generation=%u reuse=%u "
+              "lastOp=%s mutationAgeUs=%" PRIu64 " target=0x%x level=%d levels=%d "
+              "internal=0x%x size=%dx%d format=0x%x type=0x%x pixels=%d storageCalls=%u "
+              "uploads=%u imageSuccess=%u liveImages=%u requestLevel=%d preserved=%d "
+              "globalSuccess=%" PRIu64 " globalFail=%" PRIu64 " globalDestroy=%" PRIu64
+              " globalLive=%" PRIu64 " globalPeak=%" PRIu64 " trackedImages=%zu",
+              api, context, gCurrentContext, group, gCurrentGroup, texture,
+              foundRecord ? 1 : 0, snapshot.generation, snapshot.reuseCount, snapshot.lastOp,
+              ageUs(snapshot.lastMutationNs, timestamp), snapshot.target, snapshot.level,
+              snapshot.levels, snapshot.internalFormat, snapshot.width, snapshot.height,
+              snapshot.format, snapshot.type, snapshot.pixelsPresent ? 1 : 0,
+              snapshot.storageCalls, snapshot.uploadCalls, snapshot.imageSuccesses,
+              snapshot.liveImages, level, preserved, successTotal, failureTotal, destroyTotal,
+              liveTotal, peakLiveTotal, trackedImages);
+        return;
+    }
 
     ALOGE("BBRY_GL_TEX_IMAGE_FAIL api=%s ctx=%p currentCtx=%p ctxGroup=%" PRIu64
           " currentGroup=%" PRIu64 " texture=0x%x found=%d generation=%u reuse=%u live=%d "
@@ -328,7 +367,9 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
           " mutationAgeUs=%" PRIu64 " target=0x%x level=%d levels=%d internal=0x%x "
           "size=%dx%d format=0x%x type=0x%x pixels=%d storageCalls=%u uploads=%u "
           "imageSuccess=%u imageFail=%u liveImages=%u imageDestroy=%u retiredLiveImages=%u "
-          "lastSuccessAgeUs=%" PRIu64 " requestLevel=%d preserved=%d",
+          "lastSuccessAgeUs=%" PRIu64 " requestLevel=%d preserved=%d globalSuccess=%" PRIu64
+          " globalFail=%" PRIu64 " globalDestroy=%" PRIu64 " globalLive=%" PRIu64
+          " globalPeak=%" PRIu64 " trackedImages=%zu",
           api, context, gCurrentContext, group, gCurrentGroup, texture, foundRecord ? 1 : 0,
           snapshot.generation, snapshot.reuseCount, snapshot.live ? 1 : 0,
           snapshot.generated ? 1 : 0, snapshot.deleteRequested ? 1 : 0, snapshot.lastOp,
@@ -339,7 +380,8 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
           snapshot.storageCalls, snapshot.uploadCalls, snapshot.imageSuccesses,
           snapshot.imageFailures, snapshot.liveImages, snapshot.imageDestroys,
           snapshot.retiredLiveImages, ageUs(snapshot.lastImageSuccessNs, timestamp), level,
-          preserved);
+          preserved, successTotal, failureTotal, destroyTotal, liveTotal, peakLiveTotal,
+          trackedImages);
 }
 
 void recordImageDestroy(EGLImageKHR image, EGLBoolean result) {
@@ -357,6 +399,8 @@ void recordImageDestroy(EGLImageKHR image, EGLBoolean result) {
         record.imageDestroys++;
     }
     gImages.erase(imageIt);
+    gImageDestroyTotal++;
+    if (gLiveImageTotal) gLiveImageTotal--;
 }
 
 EGLContext EGLAPIENTRY layerEglCreateContext(EGLDisplay display, EGLConfig config,
