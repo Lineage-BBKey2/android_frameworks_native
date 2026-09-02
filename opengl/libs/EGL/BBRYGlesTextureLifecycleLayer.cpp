@@ -61,7 +61,15 @@ using PFN_glEGLImageTargetTextureStorageEXT = void(GL_APIENTRYP)(GLuint, GLeglIm
 using PFN_eglCreateImage = EGLImage(EGLAPIENTRYP)(EGLDisplay, EGLContext, EGLenum, EGLClientBuffer,
                                                   const EGLAttrib*);
 using PFN_eglDestroyImage = EGLBoolean(EGLAPIENTRYP)(EGLDisplay, EGLImage);
+using PFN_eglGetDisplay = EGLDisplay(EGLAPIENTRYP)(EGLNativeDisplayType);
+using PFN_eglGetPlatformDisplay = EGLDisplay(EGLAPIENTRYP)(EGLenum, void*, const EGLAttrib*);
+using PFN_eglInitialize = EGLBoolean(EGLAPIENTRYP)(EGLDisplay, EGLint*, EGLint*);
+using PFN_eglTerminate = EGLBoolean(EGLAPIENTRYP)(EGLDisplay);
 
+PFN_eglGetDisplay gNextEglGetDisplay = nullptr;
+PFN_eglGetPlatformDisplay gNextEglGetPlatformDisplay = nullptr;
+PFN_eglInitialize gNextEglInitialize = nullptr;
+PFN_eglTerminate gNextEglTerminate = nullptr;
 PFNEGLCREATECONTEXTPROC gNextEglCreateContext = nullptr;
 PFNEGLDESTROYCONTEXTPROC gNextEglDestroyContext = nullptr;
 PFNEGLMAKECURRENTPROC gNextEglMakeCurrent = nullptr;
@@ -187,6 +195,7 @@ uint64_t gImageDestroyTotal = 0;
 uint64_t gLiveImageTotal = 0;
 uint64_t gPeakLiveImageTotal = 0;
 uint64_t gMakeCurrentSequence = 0;
+uint64_t gDisplaySequence = 0;
 
 thread_local EGLContext gCurrentContext = EGL_NO_CONTEXT;
 thread_local uint64_t gCurrentGroup = 0;
@@ -198,6 +207,11 @@ void getThreadName(char (&name)[16]) {
     if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0 || !name[0]) {
         memcpy(name, "unknown", sizeof("unknown"));
     }
+}
+
+uint64_t nextDisplaySequence() {
+    std::lock_guard<std::mutex> guard(gLock);
+    return ++gDisplaySequence;
 }
 
 void parseContextAttributes(const EGLint* attributes, ContextRecord* record) {
@@ -540,23 +554,95 @@ void recordImageResult(const char* api, EGLContext context, EGLenum target, EGLC
           contextSnapshot.lastDraw, contextSnapshot.lastRead, gCurrentDraw, gCurrentRead);
 }
 
-void recordImageDestroy(EGLImageKHR image, EGLBoolean result) {
-    if (result != EGL_TRUE || image == EGL_NO_IMAGE_KHR) return;
+void recordImageDestroy(const char* api, EGLDisplay display, EGLImageKHR image,
+                        EGLBoolean result) {
+    if (image == EGL_NO_IMAGE_KHR) return;
 
-    std::lock_guard<std::mutex> guard(gLock);
-    auto imageIt = gImages.find(reinterpret_cast<uintptr_t>(image));
-    if (imageIt == gImages.end()) return;
+    bool tracked = false;
+    ImageRecord imageRecord;
+    uint64_t destroyTotal = 0;
+    uint64_t liveTotal = 0;
+    size_t trackedImages = 0;
+    {
+        std::lock_guard<std::mutex> guard(gLock);
+        auto imageIt = gImages.find(reinterpret_cast<uintptr_t>(image));
+        tracked = imageIt != gImages.end();
+        if (tracked) imageRecord = imageIt->second;
 
-    auto textureIt = gTextures.find(imageIt->second.texture);
-    if (textureIt != gTextures.end() &&
-        textureIt->second.generation == imageIt->second.generation) {
-        TextureRecord& record = textureIt->second;
-        if (record.liveImages) record.liveImages--;
-        record.imageDestroys++;
+        if (result == EGL_TRUE && tracked) {
+            auto textureIt = gTextures.find(imageIt->second.texture);
+            if (textureIt != gTextures.end() &&
+                textureIt->second.generation == imageIt->second.generation) {
+                TextureRecord& record = textureIt->second;
+                if (record.liveImages) record.liveImages--;
+                record.imageDestroys++;
+            }
+            gImages.erase(imageIt);
+            gImageDestroyTotal++;
+            if (gLiveImageTotal) gLiveImageTotal--;
+        }
+        destroyTotal = gImageDestroyTotal;
+        liveTotal = gLiveImageTotal;
+        trackedImages = gImages.size();
     }
-    gImages.erase(imageIt);
-    gImageDestroyTotal++;
-    if (gLiveImageTotal) gLiveImageTotal--;
+
+    if (!tracked && result == EGL_TRUE) return;
+
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_IMAGE_DESTROY api=%s display=%p image=%p result=%d tracked=%d "
+          "group=%" PRIu64 " texture=0x%x generation=%u globalDestroy=%" PRIu64
+          " globalLive=%" PRIu64 " trackedImages=%zu tid=%d thread=%s",
+          api, display, image, result, tracked ? 1 : 0, imageRecord.texture.group,
+          imageRecord.texture.name, imageRecord.generation, destroyTotal, liveTotal,
+          trackedImages, gettid(), threadName);
+}
+
+EGLDisplay EGLAPIENTRY layerEglGetDisplay(EGLNativeDisplayType nativeDisplay) {
+    EGLDisplay result = gNextEglGetDisplay(nativeDisplay);
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_DISPLAY_GET seq=%" PRIu64 " api=legacy native=%p result=%p "
+          "tid=%d thread=%s",
+          nextDisplaySequence(), nativeDisplay, result, gettid(), threadName);
+    return result;
+}
+
+EGLDisplay EGLAPIENTRY layerEglGetPlatformDisplay(EGLenum platform, void* nativeDisplay,
+                                                  const EGLAttrib* attributes) {
+    EGLDisplay result = gNextEglGetPlatformDisplay(platform, nativeDisplay, attributes);
+    uint32_t attributeCount = 0;
+    for (const EGLAttrib* attr = attributes; attr && attr[0] != EGL_NONE && attributeCount < 32;
+         attr += 2) {
+        attributeCount++;
+    }
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_DISPLAY_GET seq=%" PRIu64
+          " api=platform platform=0x%x native=%p result=%p attrCount=%u tid=%d thread=%s",
+          nextDisplaySequence(), platform, nativeDisplay, result, attributeCount, gettid(),
+          threadName);
+    return result;
+}
+
+EGLBoolean EGLAPIENTRY layerEglInitialize(EGLDisplay display, EGLint* major, EGLint* minor) {
+    EGLBoolean result = gNextEglInitialize(display, major, minor);
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_DISPLAY_INITIALIZE seq=%" PRIu64
+          " display=%p result=%d version=%d.%d tid=%d thread=%s",
+          nextDisplaySequence(), display, result, major ? *major : -1, minor ? *minor : -1,
+          gettid(), threadName);
+    return result;
+}
+
+EGLBoolean EGLAPIENTRY layerEglTerminate(EGLDisplay display) {
+    EGLBoolean result = gNextEglTerminate(display);
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_DISPLAY_TERMINATE seq=%" PRIu64 " display=%p result=%d tid=%d thread=%s",
+          nextDisplaySequence(), display, result, gettid(), threadName);
+    return result;
 }
 
 EGLContext EGLAPIENTRY layerEglCreateContext(EGLDisplay display, EGLConfig config,
@@ -598,12 +684,23 @@ EGLContext EGLAPIENTRY layerEglCreateContext(EGLDisplay display, EGLConfig confi
 }
 
 EGLBoolean EGLAPIENTRY layerEglDestroyContext(EGLDisplay display, EGLContext context) {
+    uint64_t group = 0;
+    {
+        std::lock_guard<std::mutex> guard(gLock);
+        auto found = gContexts.find(reinterpret_cast<uintptr_t>(context));
+        if (found != gContexts.end()) group = found->second.group;
+    }
     EGLBoolean result = gNextEglDestroyContext(display, context);
     if (result == EGL_TRUE && context != EGL_NO_CONTEXT) {
         std::lock_guard<std::mutex> guard(gLock);
         auto found = gContexts.find(reinterpret_cast<uintptr_t>(context));
         if (found != gContexts.end()) found->second.destroyRequested = true;
     }
+    char threadName[16];
+    getThreadName(threadName);
+    ALOGI("BBRY_GL_CONTEXT_DESTROY display=%p ctx=%p group=%" PRIu64
+          " result=%d tid=%d thread=%s",
+          display, context, group, result, gettid(), threadName);
     return result;
 }
 
@@ -713,7 +810,7 @@ EGLImageKHR EGLAPIENTRY layerEglCreateImageKHR(EGLDisplay display, EGLContext co
 
 EGLBoolean EGLAPIENTRY layerEglDestroyImageKHR(EGLDisplay display, EGLImageKHR image) {
     EGLBoolean result = gNextEglDestroyImageKHR(display, image);
-    recordImageDestroy(image, result);
+    recordImageDestroy("KHR", display, image, result);
     return result;
 }
 
@@ -726,7 +823,7 @@ EGLImage EGLAPIENTRY layerEglCreateImage(EGLDisplay display, EGLContext context,
 
 EGLBoolean EGLAPIENTRY layerEglDestroyImage(EGLDisplay display, EGLImage image) {
     EGLBoolean result = gNextEglDestroyImage(display, image);
-    recordImageDestroy(image, result);
+    recordImageDestroy("EGL15", display, image, result);
     return result;
 }
 
@@ -893,6 +990,10 @@ __attribute__((visibility("default"))) EGLFuncPointer AndroidGLESLayer_GetProcAd
         return result;                                                                     \
     }
 
+    BBRY_INTERCEPT(eglGetDisplay, gNextEglGetDisplay, layerEglGetDisplay)
+    BBRY_INTERCEPT(eglGetPlatformDisplay, gNextEglGetPlatformDisplay, layerEglGetPlatformDisplay)
+    BBRY_INTERCEPT(eglInitialize, gNextEglInitialize, layerEglInitialize)
+    BBRY_INTERCEPT(eglTerminate, gNextEglTerminate, layerEglTerminate)
     BBRY_INTERCEPT(eglCreateContext, gNextEglCreateContext, layerEglCreateContext)
     BBRY_INTERCEPT(eglDestroyContext, gNextEglDestroyContext, layerEglDestroyContext)
     BBRY_INTERCEPT(eglMakeCurrent, gNextEglMakeCurrent, layerEglMakeCurrent)
