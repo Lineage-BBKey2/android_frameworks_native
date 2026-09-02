@@ -1707,16 +1707,36 @@ EGLImageKHR eglCreateImageTmpl(EGLDisplay dpy, EGLContext ctx, EGLenum target,
             }
 
             if (imagePreserved) {
+                // Consume the original vendor EGL error, then wait for
+                // outstanding client rendering before retrying the exact
+                // same texture-backed EGLImage request.
                 const EGLint firstError = cnx->egl.eglGetError();
+
+                EGLBoolean waitResult = EGL_FALSE;
+                EGLint waitError = EGL_SUCCESS;
+                const char* waitKind = "none";
+
+                if (cnx->egl.eglWaitClient) {
+                    waitKind = "client";
+                    waitResult = cnx->egl.eglWaitClient();
+                } else if (cnx->egl.eglWaitGL) {
+                    waitKind = "gl";
+                    waitResult = cnx->egl.eglWaitGL();
+                }
+
+                if (waitResult != EGL_TRUE && waitKind[0] != 'n') {
+                    waitError = cnx->egl.eglGetError();
+                }
 
                 EGLImageKHR sameRetry =
                         eglCreateImageFunc(dp->disp.dpy, driverContext, target, buffer,
                                            driverAttribs);
 
                 if (sameRetry != EGL_NO_IMAGE_KHR) {
-                    ALOGE("BBRY_EGL_IMAGE_RETRY target=0x%x buffer=%p "
-                          "firstError=0x%x sameRetry=1 preserveFalseRetry=-1",
-                          target, buffer, firstError);
+                    ALOGE("BBRY_EGL_IMAGE_WAIT_RETRY target=0x%x buffer=%p "
+                          "firstError=0x%x wait=%s waitResult=%d waitError=0x%x "
+                          "sameRetry=1 preserveFalseRetry=-1",
+                          target, buffer, firstError, waitKind, waitResult, waitError);
                     result = sameRetry;
                 } else {
                     const EGLint sameRetryError = cnx->egl.eglGetError();
@@ -1736,10 +1756,11 @@ EGLImageKHR eglCreateImageTmpl(EGLDisplay dpy, EGLContext ctx, EGLenum target,
                             eglCreateImageFunc(dp->disp.dpy, driverContext, target, buffer,
                                                retryAttribs.data());
 
-                    ALOGE("BBRY_EGL_IMAGE_RETRY target=0x%x buffer=%p "
-                          "firstError=0x%x sameError=0x%x sameRetry=0 "
-                          "preserveFalseRetry=%d",
-                          target, buffer, firstError, sameRetryError,
+                    ALOGE("BBRY_EGL_IMAGE_WAIT_RETRY target=0x%x buffer=%p "
+                          "firstError=0x%x wait=%s waitResult=%d waitError=0x%x "
+                          "sameError=0x%x sameRetry=0 preserveFalseRetry=%d",
+                          target, buffer, firstError, waitKind, waitResult, waitError,
+                          sameRetryError,
                           preserveFalseRetry != EGL_NO_IMAGE_KHR ? 1 : 0);
 
                     if (preserveFalseRetry != EGL_NO_IMAGE_KHR) {
