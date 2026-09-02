@@ -295,3 +295,25 @@ cc_library_shared {
     srcs: ["GLES2/gl2.cpp"],
     cflags: ["-DLOG_TAG=\"libGLESv3\""],
 }
+
+// Temporary per-application GLES layer used to correlate failed texture-backed
+// EGLImage creation with GL texture lifecycle and context-sharing activity on
+// the legacy BlackBerry SDM660 graphics stack.
+cc_library_shared {
+    name: "libbbry_gles_texture_lifecycle",
+    srcs: ["EGL/BBRYGlesTextureLifecycleLayer.cpp"],
+    compile_multilib: "64",
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-DGL_GLEXT_PROTOTYPES",
+        "-DEGL_EGLEXT_PROTOTYPES",
+        "-fvisibility=hidden",
+    ],
+    shared_libs: ["liblog"],
+    header_libs: ["gl_headers"],
+
+    // Layers loaded from /data/local/debug/gles cannot safely resolve
+    // libc++_shared from an application namespace.
+    stl: "libc++_static",
+}
