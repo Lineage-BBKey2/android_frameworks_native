@@ -125,6 +125,14 @@ public:
     virtual void pokeUserActivity(nsecs_t eventTime, int32_t eventType,
                                   ui::LogicalDisplayId displayId, int32_t keyCode) = 0;
 
+    /**
+     * Notifies the policy about activity from a navigation touchpad.
+     *
+     * This has a default no-op implementation so existing test policies and
+     * non-Android policy implementations do not all require changes.
+     */
+    virtual void notifyTouchpadActivity(nsecs_t /* eventTime */) {}
+
     /*
      * Return true if the provided event is stale, and false otherwise. Used for determining
      * whether the dispatcher should drop the event.
