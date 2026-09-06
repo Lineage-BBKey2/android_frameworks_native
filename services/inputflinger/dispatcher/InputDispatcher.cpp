@@ -3299,6 +3299,22 @@ void InputDispatcher::pokeUserActivityLocked(const EventEntry& eventEntry) {
         return;
     }
 
+    if (eventEntry.type == EventEntry::Type::MOTION) {
+        const MotionEntry& motionEntry =
+                static_cast<const MotionEntry&>(eventEntry);
+
+        if (motionEntry.action != AMOTION_EVENT_ACTION_CANCEL
+                && isFromSource(motionEntry.source,
+                        AINPUT_SOURCE_TOUCHPAD)) {
+            auto command = [this, eventTime = eventEntry.eventTime]()
+                    REQUIRES(mLock) {
+                scoped_unlock unlock(mLock);
+                mPolicy.notifyTouchpadActivity(eventTime);
+            };
+            postCommandLocked(std::move(command));
+        }
+    }
+
     const int32_t eventType = getUserActivityEventType(eventEntry);
     if (input_flags::rate_limit_user_activity_poke_in_dispatcher()) {
         // Note that we're directly getting the time diff between the current event and the previous
